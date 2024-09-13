@@ -23,34 +23,38 @@
 mod server;
 
 
+use std::num::NonZeroUsize;
+use std::ops::Add;
 use std::{
   net::{Ipv4Addr, Ipv6Addr},
-  time::Duration,
-  io::{stdin, stdout, Write},
-  fs::File,
+  time::{Duration, Instant},
+  io::Write,
   path::Path,
 };
 
 use anyhow::{Result, Context};
 use tokio::{
-  task,
+  io::{AsyncBufReadExt, Lines, Stdin, BufReader, stdin},
   sync::watch::{self, Receiver, Sender},
+  task,
 };
 use libp2p::{
   futures::StreamExt,
-  gossipsub::{self, MessageAuthenticity},
+  gossipsub::{self, MessageAuthenticity, IdentTopic, Topic},
+  rendezvous,
   identify,
   identity::{Keypair, PublicKey},
   kad::{self, store::MemoryStore, PROTOCOL_NAME},
   multiaddr::Protocol,
   noise,
-  swarm::{Config, NetworkBehaviour, Swarm},
+  swarm::{Config, NetworkBehaviour, Swarm, SwarmEvent},
   tcp,
   tls,
   yamux,
   Multiaddr,
   PeerId,
   SwarmBuilder,
+  bytes::BufMut,
 };
 
 use crate::server::{ServerConfig, server_main};
@@ -64,7 +68,7 @@ async fn main() -> Result<()> {
 
   let behaviour: Behaviour = Behaviour::from_key(key.clone())?;
 
-  let mut swarm: Swarm<Behaviour> = SwarmBuilder::with_existing_identity(key)
+  let mut swarm: Swarm<Behaviour> = SwarmBuilder::with_existing_identity(key.clone())
   .with_tokio()
   .with_tcp(
     tcp::Config::default(),
@@ -103,7 +107,7 @@ async fn main() -> Result<()> {
   swarm.listen_on(addr_v6_tcp)?;
   swarm.listen_on(addr_v4_udp)?;
   swarm.listen_on(addr_v6_udp)?;
-
+  println!("{}", swarm.local_peer_id());
 
   let (_server_handle, server_receiver): (Option<task::JoinHandle<Result<()>>>, Option<Receiver<(PeerId, Option<Multiaddr>, Multiaddr)>>) = if is_server_neded()? {
     let (sender, receiver): (Sender<(PeerId, Option<Multiaddr>, Multiaddr)>, Receiver<(PeerId, Option<Multiaddr>, Multiaddr)>) = watch::channel((PeerId::random(), None, Multiaddr::empty()));
@@ -112,8 +116,7 @@ async fn main() -> Result<()> {
   else {
     let server_config_path: &Path = Path::new("server_config.json");
     if server_config_path.exists() {
-      let file: File = File::options().read(true).open(server_config_path)?;
-      let server_config: ServerConfig = serde_json::from_reader(file)?;
+      let server_config: ServerConfig = ServerConfig::from_path(server_config_path)?;
 
       for addr in server_config.addresses.values() {
         swarm.behaviour_mut().kademlia.add_address(&server_config.id, addr.clone());
@@ -127,11 +130,14 @@ async fn main() -> Result<()> {
     (None, None)
   };
 
+  let mut stdin: Lines<BufReader<Stdin>> = BufReader::new(stdin()).lines();
+  let topic = IdentTopic::new("topic");
+
   loop {
     if server_receiver.is_some() {
       let mut rx: Receiver<(PeerId, Option<Multiaddr>, Multiaddr)> = server_receiver.clone().unwrap();
       tokio::select! {
-        event = swarm.next() => println!("{:?}", event),
+        event = swarm.select_next_some() => event_process(&mut swarm, event)?,
   
         _ = rx.changed() => {
           let (server_id, prev_ip, new_ip) = rx.borrow_and_update().clone();
@@ -140,11 +146,24 @@ async fn main() -> Result<()> {
           }
           swarm.behaviour_mut().kademlia.add_address(&server_id, new_ip);
         },
+
+        Ok(Some(line)) = stdin.next_line() => {
+          println!("{:?}", swarm.behaviour_mut().kademlia.get_closest_peers(key.public().to_peer_id()));
+          if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), line.as_bytes()) {
+            println!("Publish error: {e:?}");
+          }
+        },
       }
     }
     else {
       tokio::select! {
-        event = swarm.next() => println!("{:?}", event),
+        event = swarm.select_next_some() => event_process(&mut swarm, event)?,
+
+        Ok(Some(line)) = stdin.next_line() => {
+          if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic.clone(), line.as_bytes()) {
+            println!("Publish error: {e:?}");
+          }
+        },
       }
     }
   }
@@ -157,13 +176,62 @@ async fn main() -> Result<()> {
 }
 
 
+fn event_process(swarm: &mut Swarm<Behaviour>, event: SwarmEvent<BehaviourEvent>) -> Result<()> {
+  // let server_config: ServerConfig = ServerConfig::from_path("server_config.json")?;
+
+  match event {
+    SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+      propagation_source: peer_id,
+      message_id: id,
+      message,
+    })) => println!("Got message: '{}' with id: {id} from peer: {peer_id}", String::from_utf8_lossy(&message.data)),
+
+    SwarmEvent::ConnectionEstablished { peer_id, .. } if true /*peer_id == server_config.id*/ => {
+      if let Err(e) = swarm.behaviour_mut().rendezvous.register(rendezvous::Namespace::from_static("rendezvous"), peer_id, None) {
+        eprintln!("Failed to register: {e}");
+      }
+    }
+
+    SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+      result: kad::QueryResult::GetClosestPeers(Ok(ok)),
+      ..
+    })) => {
+      for i in ok.peers {
+        println!("Discovered {}", i.peer_id);
+      }
+    },
+
+    SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::OutboundQueryProgressed {
+      result,
+      ..
+    })) => {
+      println!("{:?}", result);
+    },
+
+    SwarmEvent::Behaviour(BehaviourEvent::Kademlia(kad::Event::RoutingUpdated {
+      peer,
+      is_new_peer,
+      ..
+    })) => {
+      println!("Routing updated: {peer}");
+      // if is_new_peer { swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer) }
+    },
+
+    _ => println!("{event:?}"),
+    // _ => (),
+  }
+
+  Ok(())
+}
+
+
 fn is_server_neded() -> Result<bool> {
   let mut answer: String = String::new();
 
   print!("Do you need a server? [Y/n]: ");
-  stdout().flush()?;
+  std::io::stdout().flush()?;
 
-  stdin().read_line(&mut answer)?;
+  std::io::stdin().read_line(&mut answer)?;
 
   Ok(match answer.to_lowercase().trim() {
     "y" => true,
@@ -178,6 +246,7 @@ struct Behaviour {
   gossipsub: gossipsub::Behaviour,
   identify: identify::Behaviour,
   kademlia: kad::Behaviour<MemoryStore>,
+  rendezvous: rendezvous::client::Behaviour,
 }
 
 
@@ -186,11 +255,13 @@ impl Behaviour {
     gossipsub: gossipsub::Behaviour,
     identify: identify::Behaviour,
     kademlia: kad::Behaviour<MemoryStore>,
+    rendezvous: rendezvous::client::Behaviour,
   ) -> Self {
     Self {
       gossipsub,
       identify,
       kademlia,
+      rendezvous
     }
   }
 
@@ -224,10 +295,13 @@ impl Behaviour {
       kad::Behaviour::with_config(peer_id, store, kademlia_config)
     };
 
+    let rendezvous_behaviour: rendezvous::client::Behaviour = rendezvous::client::Behaviour::new(key);
+
     Ok(Self::new(
       gossipsub_behaviour,
       identify_behaviour,
-      kademlia_behaviour
+      kademlia_behaviour,
+      rendezvous_behaviour,
     ))
   }
 }

@@ -20,6 +20,7 @@ use std::{
   net::{Ipv4Addr, Ipv6Addr},
   time::Duration,
   fs::File,
+  path::Path,
 };
 
 use anyhow::Result;
@@ -110,7 +111,7 @@ pub(crate) async fn server_main(sender: Sender<(PeerId, Option<Multiaddr>, Multi
 #[derive(NetworkBehaviour)]
 struct Behaviour {
   identify: identify::Behaviour,
-  randezvous: rendezvous::server::Behaviour,
+  // randezvous: rendezvous::server::Behaviour,
   kademlia: kad::Behaviour<MemoryStore>,
 }
 
@@ -118,12 +119,12 @@ struct Behaviour {
 impl Behaviour {
   fn new(
     identify: identify::Behaviour,
-    randezvous: rendezvous::server::Behaviour,
+    // randezvous: rendezvous::server::Behaviour,
     kademlia: kad::Behaviour<MemoryStore>,
   ) -> Self {
     Self {
       identify,
-      randezvous,
+      // randezvous,
       kademlia,
     }
   }
@@ -159,7 +160,7 @@ impl Behaviour {
 
     Ok(Self::new(
       identify_behaviour,
-      randezvous_behaviour,
+      // randezvous_behaviour,
       kademlia_behaviour,
     ))
   }
@@ -182,6 +183,12 @@ impl ServerConfig {
       id,
       addresses,
     }
+  }
+
+  
+  pub(crate) fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
+    let file: File = File::options().read(true).open(path)?;
+    Ok(serde_json::from_reader(file)?)
   }
 
 
