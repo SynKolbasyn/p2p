@@ -15,11 +15,6 @@
 //!   along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-// #![allow(unreachable_code)]
-// #![allow(unused_imports)]
-// #![allow(unused_variables)]
-
-
 mod server;
 mod server_list;
 
@@ -55,8 +50,6 @@ use crate::server_list::ServerList;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-  // let key: Keypair = Keypair::ed25519_from_bytes([10])?;
-
   if is_server()? {
     server_main().await?;
     return Ok(());
