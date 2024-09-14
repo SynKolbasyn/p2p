@@ -1,4 +1,4 @@
 /target/
 
 /Cargo.lock
-/server_config.json
+/server_list.json

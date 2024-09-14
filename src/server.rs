@@ -16,22 +16,15 @@
 
 
 use std::{
-  collections::HashMap,
   net::{Ipv4Addr, Ipv6Addr},
   time::Duration,
-  fs::File,
-  path::Path,
 };
 
 use anyhow::Result;
-use serde::{Serialize, Deserialize};
-use tokio::sync::watch::Sender;
 use libp2p::{
-  rendezvous,
   futures::StreamExt,
   identity::Keypair,
   multiaddr::Protocol,
-  core::transport::ListenerId,
   noise,
   identify,
   kad::{self, store::MemoryStore, PROTOCOL_NAME},
@@ -45,13 +38,15 @@ use libp2p::{
   identity::PublicKey,
 };
 
+use crate::server_list::ServerList;
 
-pub(crate) async fn server_main(sender: Sender<(PeerId, Option<Multiaddr>, Multiaddr)>) -> Result<()> {
+
+pub(crate) async fn server_main() -> Result<()> {
   let key: Keypair = Keypair::generate_ed25519();
 
   let behaviour: Behaviour = Behaviour::from_key(key.clone())?;
 
-  let mut swarm: Swarm<Behaviour> = SwarmBuilder::with_existing_identity(key)
+  let mut swarm: Swarm<Behaviour> = SwarmBuilder::with_existing_identity(key.clone())
   .with_tokio()
   .with_tcp(
     tcp::Config::default(),
@@ -91,17 +86,59 @@ pub(crate) async fn server_main(sender: Sender<(PeerId, Option<Multiaddr>, Multi
   swarm.listen_on(addr_v4_udp)?;
   swarm.listen_on(addr_v6_udp)?;
 
-  let mut server_config: ServerConfig = ServerConfig::from(swarm.local_peer_id());
+  swarm.behaviour_mut().kademlia.set_mode(Some(kad::Mode::Server));
+
+  let mut server_list: ServerList = ServerList::default();
+
+  println!("{}", swarm.local_peer_id());
 
   loop {
     match swarm.select_next_some().await {
-      SwarmEvent::NewListenAddr { listener_id, address } => {
-        let file: File = File::options().create(true).truncate(true).write(true).open("server_config.json")?;
-        serde_json::to_writer_pretty(file, &server_config)?;
-        sender.send((swarm.local_peer_id().clone(), server_config.add_addr(listener_id, address.clone()), address))?;
+      SwarmEvent::Behaviour(event) => {
+        match event {
+          BehaviourEvent::Identify(event) => match event {
+            identify::Event::Received { peer_id, info: identify::Info { listen_addrs, .. }, .. } => {
+              listen_addrs.iter().for_each(|addr: &Multiaddr| {
+                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+              });
+            },
+
+            identify::Event::Sent { .. } => (),
+            identify::Event::Pushed { .. } => (),
+            identify::Event::Error { .. } => (),
+          },
+
+          BehaviourEvent::Kademlia(event) => match event {
+            kad::Event::InboundRequest { .. } => (),
+            kad::Event::OutboundQueryProgressed { .. } => (),
+            kad::Event::RoutingUpdated { .. } => (),
+            kad::Event::UnroutablePeer { .. } => (),
+            kad::Event::RoutablePeer { .. } => (),
+            kad::Event::PendingRoutablePeer { .. } => (),
+            kad::Event::ModeChanged { .. } => (),
+          },
+        }
       },
 
-      // event => println!("{event:?}"),
+      SwarmEvent::ConnectionEstablished { .. } => (),
+      SwarmEvent::ConnectionClosed { .. } => (),
+      SwarmEvent::IncomingConnection { .. } => (),
+      SwarmEvent::IncomingConnectionError { .. } => (),
+      SwarmEvent::OutgoingConnectionError { .. } => (),
+
+      SwarmEvent::NewListenAddr { listener_id, address } => {
+        server_list.add_addr_and_save("server_list.json", swarm.local_peer_id().clone(), listener_id, address)?;
+      },
+
+      SwarmEvent::ExpiredListenAddr { .. } => (),
+      SwarmEvent::ListenerClosed { .. } => (),
+      SwarmEvent::ListenerError { .. } => (),
+      SwarmEvent::Dialing { .. } => (),
+      SwarmEvent::NewExternalAddrCandidate { .. } => (),
+      SwarmEvent::ExternalAddrConfirmed { .. } => (),
+      SwarmEvent::ExternalAddrExpired { .. } => (),
+      SwarmEvent::NewExternalAddrOfPeer { .. } => (),
+
       _ => (),
     }
   }
@@ -111,7 +148,6 @@ pub(crate) async fn server_main(sender: Sender<(PeerId, Option<Multiaddr>, Multi
 #[derive(NetworkBehaviour)]
 struct Behaviour {
   identify: identify::Behaviour,
-  // randezvous: rendezvous::server::Behaviour,
   kademlia: kad::Behaviour<MemoryStore>,
 }
 
@@ -119,12 +155,10 @@ struct Behaviour {
 impl Behaviour {
   fn new(
     identify: identify::Behaviour,
-    // randezvous: rendezvous::server::Behaviour,
     kademlia: kad::Behaviour<MemoryStore>,
   ) -> Self {
     Self {
       identify,
-      // randezvous,
       kademlia,
     }
   }
@@ -144,11 +178,6 @@ impl Behaviour {
       identify::Behaviour::new(identify_config)
     };
 
-    let randezvous_behaviour: rendezvous::server::Behaviour = {
-      let randezvous_config: rendezvous::server::Config = rendezvous::server::Config::default();
-      rendezvous::server::Behaviour::new(randezvous_config)
-    };
-
     let kademlia_behaviour: kad::Behaviour<MemoryStore> = {
       let mut kademlia_config: kad::Config = kad::Config::new(PROTOCOL_NAME);
       kademlia_config.set_query_timeout(Duration::from_secs(u64::MAX));
@@ -160,46 +189,7 @@ impl Behaviour {
 
     Ok(Self::new(
       identify_behaviour,
-      // randezvous_behaviour,
       kademlia_behaviour,
     ))
-  }
-}
-
-
-#[derive(Serialize, Deserialize)]
-pub(crate) struct ServerConfig {
-  pub(crate) id: PeerId,
-  pub(crate) addresses: HashMap<String, Multiaddr>,
-}
-
-
-impl ServerConfig {
-  fn new(
-    id: PeerId,
-    addresses: HashMap<String, Multiaddr>,
-  ) -> Self {
-    Self {
-      id,
-      addresses,
-    }
-  }
-
-  
-  pub(crate) fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-    let file: File = File::options().read(true).open(path)?;
-    Ok(serde_json::from_reader(file)?)
-  }
-
-
-  fn add_addr(&mut self, listener_id: ListenerId, addr: Multiaddr) -> Option<Multiaddr> {
-    self.addresses.insert(listener_id.to_string(), addr)
-  }
-}
-
-
-impl From<&PeerId> for ServerConfig {
-  fn from(peer_id: &PeerId) -> Self {
-    Self::new(peer_id.clone(), HashMap::new())
   }
 }
